@@ -7,26 +7,30 @@ use reqwest::{
     Client as HttpClient, Url,
 };
 use reqwest_middleware::ClientWithMiddleware as HttpClientWithMiddleware;
-use serde::{de::DeserializeOwned, Serialize};
+use rmp_serde::{Deserializer, Serializer};
+use serde::{Deserialize, Serialize};
 use sp1_core::stark::StarkGenericConfig;
 use twirp::Client as TwirpClient;
 
 use crate::{
-    proto::prover::{
-        CreateProofRequest, GetProofStatusRequest, GetProofStatusResponse, ProofStatus,
-        Sp1ProverServiceClient, SubmitProofRequest,
+    proto::network::{
+        BroadcastProofRequest, CreateProofRequest, GetBroadcastStatusRequest,
+        GetBroadcastStatusResponse, GetProofStatusRequest, GetProofStatusResponse,
+        NetworkServiceClient, ProofStatus, SubmitProofRequest, TransactionStatus,
     },
-    SP1ProofWithIO, SP1Stdin,
+    SP1ProofWithIO,
 };
 
-pub struct SP1ProverServiceClient {
+const DEFAULT_PROVER_NETWORK_RPC: &str = "https://rpc.succinct.xyz/";
+pub const SP1_VERIFIER_ADDRESS: &str = "0xe80608ca28139ee3d74bebd629809fbb853983a8";
+// "0x13c0e4d0a981c3a3cddcd6296851e1a362dce1aa" to test success on sep, fail on holesky
+
+pub struct NetworkClient {
     pub rpc: TwirpClient,
     pub http: HttpClientWithMiddleware,
 }
 
-const DEFAULT_PROVER_NETWORK_RPC: &str = "https://rpc.succinct.xyz/";
-
-impl SP1ProverServiceClient {
+impl NetworkClient {
     pub fn with_token(access_token: String) -> Self {
         let rpc_url = env::var("PROVER_NETWORK_RPC")
             .unwrap_or_else(|_| DEFAULT_PROVER_NETWORK_RPC.to_string());
@@ -65,11 +69,13 @@ impl SP1ProverServiceClient {
         Ok(())
     }
 
-    pub async fn create_proof(&self, elf: &[u8], stdin: SP1Stdin) -> Result<String> {
+    pub async fn create_proof(&self, elf: &[u8], stdin: &[u8]) -> Result<String> {
         let res = self.rpc.create_proof(CreateProofRequest {}).await?;
 
-        let program_bytes = bincode::serialize(elf)?;
-        let stdin_bytes = bincode::serialize(&stdin)?;
+        let mut program_bytes = Vec::new();
+        elf.serialize(&mut Serializer::new(&mut program_bytes))?;
+        let mut stdin_bytes = Vec::new();
+        stdin.serialize(&mut Serializer::new(&mut stdin_bytes))?;
         let program_promise = self.upload_file(&res.program_put_url, program_bytes);
         let stdin_promise = self.upload_file(&res.stdin_put_url, stdin_bytes);
         let v = vec![program_promise, stdin_promise];
@@ -84,7 +90,9 @@ impl SP1ProverServiceClient {
         Ok(res.id)
     }
 
-    pub async fn get_proof_status<SC: StarkGenericConfig + Serialize + DeserializeOwned>(
+    pub async fn get_proof_status<
+        SC: for<'de> Deserialize<'de> + Serialize + StarkGenericConfig,
+    >(
         &self,
         proof_id: &str,
     ) -> Result<(GetProofStatusResponse, Option<SP1ProofWithIO<SC>>)> {
@@ -95,7 +103,7 @@ impl SP1ProverServiceClient {
             })
             .await?;
 
-        let result = if res.status() == ProofStatus::Succeeded {
+        let result = if res.status() == ProofStatus::ProofSucceeded {
             let proof = self
                 .http
                 .get(res.result_get_url.clone())
@@ -103,7 +111,47 @@ impl SP1ProverServiceClient {
                 .await?
                 .bytes()
                 .await?;
-            Some(bincode::deserialize(&proof).expect("Failed to deserialize proof"))
+            let mut de = Deserializer::new(&proof[..]);
+            Some(Deserialize::deserialize(&mut de).expect("Failed to deserialize proof"))
+        } else {
+            None
+        };
+
+        Ok((res, result))
+    }
+
+    pub async fn broadcast_proof(
+        &self,
+        proof_id: &str,
+        chain_id: u32,
+        verifier: &str,
+        callback: &str,
+        callback_data: &str,
+    ) -> Result<String> {
+        let req = BroadcastProofRequest {
+            prood_id: proof_id.to_string(),
+            chain_id,
+            verifier: verifier.to_string(),
+            callback: callback.to_string(),
+            callback_data: callback_data.to_string(),
+        };
+        let result = self.rpc.broadcast_proof(req).await?;
+        Ok(result.id)
+    }
+
+    pub async fn get_broadcast_status(
+        &self,
+        tx_id: &str,
+    ) -> Result<(GetBroadcastStatusResponse, Option<String>)> {
+        let res = self
+            .rpc
+            .get_broadcast_status(GetBroadcastStatusRequest {
+                id: tx_id.to_string(),
+            })
+            .await?;
+
+        let result = if res.status() != TransactionStatus::TransactionScheduled {
+            Some(res.tx_hash.clone())
         } else {
             None
         };
