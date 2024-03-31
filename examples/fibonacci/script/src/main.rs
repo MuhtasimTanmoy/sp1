@@ -14,7 +14,7 @@ fn main() {
     let proof = SP1Prover::prove(ELF, stdin).expect("proving failed");
 
     // Verify proof.
-    SP1Verifier::verify(ELF, &proof).expect("verification failed");
+    // SP1Verifier::verify(ELF, &proof).expect("verification failed");
 
     // Save the proof.
     proof

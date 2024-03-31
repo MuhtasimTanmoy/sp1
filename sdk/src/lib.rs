@@ -14,7 +14,7 @@ pub mod utils {
     };
 }
 pub use crate::io::*;
-use proto::network::ProofStatus;
+use proto::network::{ProofStatus, TransactionStatus};
 use utils::*;
 
 use crate::client::{NetworkClient, SP1_VERIFIER_ADDRESS};
@@ -111,7 +111,7 @@ impl SP1Prover {
         }
     }
 
-    async fn broadcast_proof(
+    pub async fn broadcast_proof(
         access_token: String,
         proof_id: &str,
         chain_ids: Vec<u32>,
@@ -121,7 +121,7 @@ impl SP1Prover {
         let client = NetworkClient::with_token(access_token);
         let verifier = SP1_VERIFIER_ADDRESS;
 
-        let mut tx_ids = Vec::new();
+        let mut tx_details = Vec::new();
         for ((i, &callback), &callback_data) in
             callbacks.iter().enumerate().zip(callback_datas.iter())
         {
@@ -130,10 +130,39 @@ impl SP1Prover {
                     .broadcast_proof(proof_id, chain_id, verifier, callback, callback_data)
                     .await
                     .with_context(|| format!("Failed to broadcast proof to chain {}", chain_id))?;
-                tx_ids.push(tx_id);
+                tx_details.push((tx_id, chain_id));
             }
         }
-        Ok(tx_ids)
+
+        for (tx_id, chain_id) in tx_details.iter() {
+            loop {
+                let (status_res, maybe_tx_hash) = client.get_broadcast_status(tx_id).await?;
+
+                match status_res.status() {
+                    TransactionStatus::TransactionFinalized => {
+                        println!(
+                            "Broadcast to chain {} succeeded with tx hash: {:?}",
+                            chain_id,
+                            maybe_tx_hash.unwrap_or("None".to_string())
+                        );
+                        break;
+                    }
+                    TransactionStatus::TransactionFailed
+                    | TransactionStatus::TransactionTimedout => {
+                        return Err(anyhow::anyhow!(
+                            "Broadcast to chain {} failed with tx hash: {:?}",
+                            chain_id,
+                            maybe_tx_hash.unwrap_or("None".to_string())
+                        ));
+                    }
+                    _ => {
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                }
+            }
+        }
+
+        Ok(tx_details.into_iter().map(|(tx_id, _)| tx_id).collect())
     }
 
     /// Generate a proof for the execution of the ELF with the given public inputs and a custom config.
@@ -200,7 +229,7 @@ impl SP1Prover {
                                     .await
                                 }) {
                                     std::result::Result::Ok(tx_ids) => {
-                                        log::info!("Proofs broadcasted successfully: {:?}", tx_ids);
+                                        log::info!("Proofs broadcasted successfully");
                                         Ok(proof_with_io)
                                     }
                                     Err(e) => {
